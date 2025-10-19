@@ -1,0 +1,21 @@
+<html>
+	<h1>Cert Issuer</h1>
+	<h2>Getting & Using A Cert</h2>
+	<pre><code>
+	# Obtain a signed certificate
+	curl https://host/api/v1/{user}/certs/1 > .ssh/scale-cert.pub
+
+	# Add config for the scale servers to your ssh config
+	cat >> .ssh/config << EOF
+	Host *
+	  User {user}
+	  CertificateFile ~/.ssh/scale-cert.pub
+	EOF
+
+	</code></pre>
+
+	<h2>How does this work</h2>
+	This service issues signed certificates to allow users to access Scale infrastructure.
+
+
+</html>
