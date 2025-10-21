@@ -4,14 +4,16 @@ import (
 	"context"
 	"crypto/rand"
 	_ "embed"
+	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/google/go-github/v75/github"
 	"golang.org/x/crypto/ssh"
 )
@@ -19,167 +21,128 @@ import (
 //go:embed index.html
 var index string
 
-const DEFAULT_HTTP_ADDR string = ""
-const DEFAULT_HTTP_PORT uint16 = 8080
+const DEFAULT_HOST_PORT string = ":8080"
 const DEFAULT_CERT_DURATION_HOURS uint64 = 24 * 17
 
 type AppConfig struct {
+	HostPort          string
 	GithubToken       string
 	GithubOrg         string
 	GithubTeam        string
 	CertDurationHours uint64
-	Addr              string
-	Port              uint16
-
-	ghClient  *github.Client
-	signer    ssh.Signer
-	publicKey ssh.PublicKey
+	PrivateKey        string
+	PublicKey         string
 }
 
-func NewAppConfigFromEnv() (*AppConfig, error) {
-	ghOrg := os.Getenv("GITHUB_ORG")
-	if ghOrg == "" {
-		return nil, fmt.Errorf("No GITHUB_ORG provided")
-	}
-
-	ghTeam := os.Getenv("GITHUB_TEAM")
-	if ghTeam == "" {
-		return nil, fmt.Errorf("No GITHUB_TEAM provided")
-	}
-
-	privateKeyRaw := os.Getenv("PRIVATE_KEY")
-	if privateKeyRaw == "" {
-		return nil, fmt.Errorf("No PRIVATE_KEY provided")
-	}
-	signer, err := ssh.ParsePrivateKey([]byte(privateKeyRaw))
+func NewAppConfigFromFile(filename string) (*AppConfig, error) {
+	b, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse PRIVATE_KEY: %w", err)
+		return nil, fmt.Errorf("faild to read file: %w", err)
 	}
-
-	publicKeyRaw := os.Getenv("PUBLIC_KEY")
-	if publicKeyRaw == "" {
-		return nil, fmt.Errorf("No PUBLIC_KEY provided")
+	config := &AppConfig{
+		HostPort:          DEFAULT_HOST_PORT,
+		CertDurationHours: DEFAULT_CERT_DURATION_HOURS,
 	}
-	publicKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(publicKeyRaw))
+	_, err = toml.Decode(string(b), config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse PUBLIC_KEY: %w", err)
+		return nil, fmt.Errorf("faild to parse config: %w", err)
 	}
-
-	ghToken := os.Getenv("GITHUB_TOKEN")
-	if ghToken == "" {
-		return nil, fmt.Errorf("No GITHUB_TOKEN provided")
-	}
-	ghClient := github.NewClient(nil).WithAuthToken(ghToken)
-
-	var certDuration uint64 = DEFAULT_CERT_DURATION_HOURS
-	certDurationEnv := os.Getenv("CERT_DURATION_HOURS")
-	if certDurationEnv != "" {
-		certDuration, err = strconv.ParseUint(certDurationEnv, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("Bad CERT_DURATION_HOURS provided: %w", err)
-		}
-	} else {
-		slog.Info("CERT_DURATION_HOURS not provided using default",
-			"default", DEFAULT_CERT_DURATION_HOURS)
-	}
-
-	var port = DEFAULT_HTTP_PORT
-	portRaw := os.Getenv("HTTP_PORT")
-	if portRaw != "" {
-		p, err := strconv.ParseUint(portRaw, 10, 16)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse HTTP_PORT: %w", err)
-		}
-		port = uint16(p)
-	}
-
-	var addr = DEFAULT_HTTP_ADDR
-	addrRaw := os.Getenv("HTTP_ADDR")
-	if addrRaw != "" {
-		addr = addrRaw
-	}
-
-	return &AppConfig{
-		GithubOrg:         ghOrg,
-		GithubTeam:        ghTeam,
-		CertDurationHours: certDuration,
-		Addr:              addr,
-		Port:              port,
-
-		ghClient:  ghClient,
-		signer:    signer,
-		publicKey: publicKey,
-	}, nil
+	return config, nil
 }
 
 type App struct {
 	config *AppConfig
 	mux    *http.ServeMux
+
+	ghClient *github.Client
+	signer   ssh.Signer
+	public   ssh.PublicKey
+
+	cacheMu sync.Mutex
+	// map user:keys
+	cache map[string][]ssh.PublicKey
 }
 
-func NewApp(config AppConfig) *App {
+func NewApp(config AppConfig) (*App, error) {
 	app := &App{
 		config: &config,
 		mux:    http.NewServeMux(),
 	}
 
+	var err error
+
+	app.signer, err = ssh.ParsePrivateKey([]byte(config.PrivateKey))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PRIVATE_KEY: %w", err)
+	}
+	app.public, _, _, _, err = ssh.ParseAuthorizedKey([]byte(config.PublicKey))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse PUBLIC_KEY: %w", err)
+	}
+	app.ghClient = github.NewClient(nil).WithAuthToken(config.GithubToken)
+
 	app.mux.HandleFunc("GET /", app.index)
+	app.mux.HandleFunc("GET /api/v1/pub", app.pub)
 	app.mux.HandleFunc("GET /api/v1/{user}/allowed", app.allowed)
 	app.mux.HandleFunc("GET /api/v1/{user}/keys", app.keys)
 	app.mux.HandleFunc("GET /api/v1/{user}/keys/{id}", app.keys)
 	app.mux.HandleFunc("GET /api/v1/{user}/certs", app.certs)
 	app.mux.HandleFunc("GET /api/v1/{user}/certs/{id}", app.certs)
 
-	return app
+	app.mux.HandleFunc("GET /api/v1/debug/cache", app.cacheHandler)
+
+	return app, nil
 }
 
 func (a *App) index(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(index))
 }
 
+func (a *App) pub(w http.ResponseWriter, r *http.Request) {
+	w.Write(ssh.MarshalAuthorizedKey(a.public))
+}
+
 func (a *App) allowed(w http.ResponseWriter, r *http.Request) {
 	user := r.PathValue("user")
-	ctx := context.WithValue(r.Context(), "user", user)
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
 
-	allowed, err := a.userIsAllowed(ctx, user)
-	if err != nil {
-		slog.ErrorContext(ctx, "failed to authorize", "err", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-	}
-	if !allowed {
+	_, ok := a.cache[user]
+	if !ok {
 		w.WriteHeader(http.StatusUnauthorized)
 	}
-	io.WriteString(w, fmt.Sprint(allowed))
 }
 
 func (a *App) keys(w http.ResponseWriter, r *http.Request) {
 	user := r.PathValue("user")
 	ctx := context.WithValue(r.Context(), "user", user)
 
-	keys, err := a.getUserPublicKeys(ctx, user)
-	if err != nil {
-		slog.ErrorContext(ctx, "failed to get user keys", "err", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
 	var id int = -1
 	idRaw := r.PathValue("id")
 	if idRaw != "" {
-		id, err = strconv.Atoi(idRaw)
+		i, err := strconv.ParseInt(idRaw, 10, 32)
 		if err != nil {
 			slog.ErrorContext(ctx, "failed to parse id", "err", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
+		id = int(i)
+	}
+
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+
+	keys, ok := a.cache[user]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
 
 	for idx, key := range keys {
 		if id != -1 && idx != id {
 			continue
 		}
-		_, err := w.Write(ssh.MarshalAuthorizedKey(key))
-		if err != nil {
-			slog.ErrorContext(ctx, "failed to write reponse", "err", err.Error())
-		}
+		w.Write(ssh.MarshalAuthorizedKey(key))
 	}
 
 }
@@ -188,22 +151,13 @@ func (a *App) certs(w http.ResponseWriter, r *http.Request) {
 	user := r.PathValue("user")
 	ctx := context.WithValue(r.Context(), "user", user)
 
-	allowed, err := a.userIsAllowed(ctx, user)
-	if err != nil {
-		slog.ErrorContext(ctx, "failed to authorize", "err", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	if !allowed {
-		slog.InfoContext(ctx, "not allowed")
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
 
-	keys, err := a.getUserPublicKeys(ctx, user)
-	if err != nil {
-		slog.ErrorContext(ctx, "failed to get user key", "err", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
+	keys, ok := a.cache[user]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
 
 	var id int = -1
@@ -213,10 +167,6 @@ func (a *App) certs(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			slog.ErrorContext(ctx, "failed to parse id", "err", err.Error())
 			w.WriteHeader(http.StatusBadRequest)
-			_, err := io.WriteString(w, "failed to parse id")
-			if err != nil {
-				slog.ErrorContext(ctx, "failed to write reponse", "err", err.Error())
-			}
 			return
 		}
 		id = int(i)
@@ -231,33 +181,63 @@ func (a *App) certs(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			slog.ErrorContext(ctx, "failed to sign key", "err", err.Error())
 			w.WriteHeader(http.StatusInternalServerError)
-			_, err := io.WriteString(w, "failed to sign key")
-			if err != nil {
-				slog.ErrorContext(ctx, "failed to write reponse", "err", err.Error())
-			}
 			return
 		}
-		_, err = w.Write(ssh.MarshalAuthorizedKey(cert))
-		if err != nil {
-			slog.ErrorContext(ctx, "failed to write reponse", "err", err.Error())
-		}
+		w.Write(ssh.MarshalAuthorizedKey(cert))
 	}
 
 }
 
-func (a *App) userIsAllowed(ctx context.Context, user string) (bool, error) {
-	org := a.config.GithubOrg
-	team := a.config.GithubTeam
-	membership, res, err := a.config.ghClient.Teams.
-		GetTeamMembershipBySlug(ctx, org, team, user)
+func (a *App) cacheHandler(w http.ResponseWriter, r *http.Request) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+
+	b, _ := json.Marshal(a.cache)
+	w.Write(b)
+}
+
+func (a *App) refreshCache() {
+	slog.Info("starting cache refresh")
+	start := time.Now()
+	defer func() {
+		slog.Info("finished cache refresh", "duration", time.Since(start))
+	}()
+
+	ctx := context.Background()
+	newCache := make(map[string][]ssh.PublicKey)
+	members, _, err := a.ghClient.Teams.ListTeamMembersBySlug(
+		ctx,
+		a.config.GithubOrg,
+		a.config.GithubTeam,
+		nil,
+	)
 	if err != nil {
-		if res.StatusCode == http.StatusNotFound {
-			err = nil
-		}
-		return false, err
+		slog.ErrorContext(ctx, "failed to get team", "err", err)
 	}
-	allowed := membership.State != nil && *membership.State == "active"
-	return allowed, nil
+	for _, member := range members {
+		login := member.GetLogin()
+		ctx = context.WithValue(ctx, "user", login)
+		keys, _, err := a.ghClient.Users.ListKeys(ctx, login, nil)
+		if err != nil {
+			slog.ErrorContext(ctx, "failed to get keys", "err", err)
+		}
+		for _, key := range keys {
+			sshKey, _, _, _, err := ssh.ParseAuthorizedKey(
+				[]byte(key.GetKey()))
+			if err != nil {
+				slog.ErrorContext(ctx, "failed to parse key",
+					"key", key.GetKey(),
+					"err", err,
+				)
+				continue
+			}
+			newCache[login] = append(newCache[login], sshKey)
+		}
+	}
+
+	a.cacheMu.Lock()
+	a.cache = newCache
+	a.cacheMu.Unlock()
 }
 
 func (a *App) sign(key ssh.PublicKey) (*ssh.Certificate, error) {
@@ -267,28 +247,10 @@ func (a *App) sign(key ssh.PublicKey) (*ssh.Certificate, error) {
 		CertType:    ssh.UserCert,
 		ValidBefore: uint64(time.Now().Add(duration).Unix()),
 	}
-	if err := certificate.SignCert(rand.Reader, a.config.signer); err != nil {
+	if err := certificate.SignCert(rand.Reader, a.signer); err != nil {
 		return nil, fmt.Errorf("failed to sign cert: %w", err)
 	}
 	return &certificate, nil
-}
-
-func (a *App) getUserPublicKeys(ctx context.Context, githubHandle string) ([]ssh.PublicKey, error) {
-	keys, _, err := a.config.ghClient.Users.ListKeys(ctx, githubHandle, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	var sshKeys []ssh.PublicKey
-	for _, key := range keys {
-		sshKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(key.GetKey()))
-		if err != nil {
-			slog.Error("failed to parse key", "err", err, "key", key)
-			continue
-		}
-		sshKeys = append(sshKeys, sshKey)
-	}
-	return sshKeys, nil
 }
 
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -297,14 +259,28 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	config, err := NewAppConfigFromEnv()
-	if err != nil {
-		slog.Error("failed to parse config", "err", err)
+	if len(os.Args) < 2 {
+		slog.Error("No config file provided")
 		return
 	}
-	app := NewApp(*config)
-	slog.Info("Listening", "port", app.config.Port)
-	addr := fmt.Sprintf("%s:%d", config.Addr, config.Port)
-	err = http.ListenAndServe(addr, app)
+	configFile := os.Args[1]
+	config, err := NewAppConfigFromFile(configFile)
+	app, err := NewApp(*config)
+	if err != nil {
+		slog.Error("failed to start", "err", err)
+		return
+	}
+
+	app.refreshCache()
+
+	go func() {
+		for {
+			app.refreshCache()
+			time.Sleep(time.Minute)
+		}
+	}()
+
+	slog.Info("Listening", "hostPort", app.config.HostPort)
+	err = http.ListenAndServe(config.HostPort, app)
 	slog.Error("exited server", "err", err)
 }
